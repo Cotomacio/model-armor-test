@@ -142,15 +142,17 @@ The script reads a comma-separated CSV with three columns:
 | `Is_Attack` | yes | Ground-truth binary label. Accepts `yes` / `y` / `true` / `1` for attacks, anything else (or empty) is treated as safe. |
 | `Category` | optional | Expected Model Armor category for attack rows. Leave empty for safe rows. Multiple categories may be separated with `\|` or `,` (e.g. `PROMPT_INJECTION\|PII`). |
 
-Accepted category values (case-insensitive, normalized via `map_category`):
+Accepted category values (case-insensitive). Each official family also accepts a few aliases:
 
-```
-PROMPT_INJECTION   – jailbreaks, instruction overrides
-RESPONSIBLE_AI     – hate, harassment, dangerous, sexually explicit, toxicity
-PII                – personally identifiable / sensitive data
-MALICIOUS_URIS     – malicious links
-CSAM               – child sexual abuse material
-```
+| Official family | Accepted aliases | Description |
+|---|---|---|
+| `PROMPT_INJECTION` | `JAILBREAK`, `PI_AND_JAILBREAK` | Jailbreaks, instruction overrides |
+| `RESPONSIBLE_AI` | `RAI`, `TOXICITY`, `HATE_SPEECH`, `HARASSMENT`, `DANGEROUS`, `SEXUALLY_EXPLICIT` | Hate, harassment, dangerous, sexually explicit, toxicity |
+| `PII` | `SDP`, `SENSITIVE_DATA` | Personally identifiable / sensitive data |
+| `MALICIOUS_URIS` | `MALICIOUS_URI`, `URIS` | Malicious links |
+| `CSAM` | — | Child sexual abuse material |
+
+> **Strict validation.** Any value in the `Category` column that doesn't match one of the names above (case-insensitive) is rejected at load time — the script prints the offending row(s) and exits **before** any API call is made. This prevents typos like `RESPONSIBLE-AI` or `MALICIOUS_URL` from silently inflating False Positives in your per-category metrics.
 
 Example (`data.csv`):
 

@@ -28,6 +28,18 @@ from google.auth.transport.requests import Request
 # Official Model Armor filter families this script reports on.
 KNOWN_CATEGORIES = ('PROMPT_INJECTION', 'RESPONSIBLE_AI', 'PII', 'MALICIOUS_URIS', 'CSAM')
 
+# Accepted aliases for the CSV Category column. Each maps to one of KNOWN_CATEGORIES.
+# Comparison is case-insensitive (input is upper()-cased before lookup).
+CATEGORY_ALIASES: Dict[str, Tuple[str, ...]] = {
+    'PROMPT_INJECTION': ('PROMPT_INJECTION', 'JAILBREAK', 'PI_AND_JAILBREAK'),
+    'RESPONSIBLE_AI':   ('RESPONSIBLE_AI', 'RAI', 'TOXICITY', 'HATE_SPEECH',
+                         'HARASSMENT', 'DANGEROUS', 'SEXUALLY_EXPLICIT'),
+    'PII':              ('PII', 'SDP', 'SENSITIVE_DATA'),
+    'MALICIOUS_URIS':   ('MALICIOUS_URIS', 'MALICIOUS_URI', 'URIS'),
+    'CSAM':             ('CSAM',),
+}
+VALID_CATEGORY_ALIASES = frozenset(a for aliases in CATEGORY_ALIASES.values() for a in aliases)
+
 
 class ModelArmorClient:
     def __init__(self, project_id: str, template_id: str, location: str):
@@ -130,19 +142,13 @@ class _StaticTokenCredentials:
 
 
 def map_category(raw_category: str) -> str:
-    """Map labels from the CSV and the API to the official Model Armor filter families."""
+    """Map a label to the official Model Armor filter family. Returns the
+    raw input unchanged if no alias matches (callers should validate first
+    via VALID_CATEGORY_ALIASES if strictness is required)."""
     cat = raw_category.upper().strip()
-
-    if cat in ('TOXICITY', 'HATE_SPEECH', 'HARASSMENT', 'DANGEROUS', 'SEXUALLY_EXPLICIT', 'RAI', 'RESPONSIBLE_AI'):
-        return 'RESPONSIBLE_AI'
-    if cat in ('PROMPT_INJECTION', 'JAILBREAK', 'PI_AND_JAILBREAK'):
-        return 'PROMPT_INJECTION'
-    if cat in ('PII', 'SDP', 'SENSITIVE_DATA'):
-        return 'PII'
-    if cat in ('MALICIOUS_URIS', 'MALICIOUS_URI', 'URIS'):
-        return 'MALICIOUS_URIS'
-    if cat == 'CSAM':
-        return 'CSAM'
+    for family, aliases in CATEGORY_ALIASES.items():
+        if cat in aliases:
+            return family
     return cat
 
 
@@ -215,8 +221,17 @@ def parse_expected_categories(raw: str) -> Set[str]:
     return {map_category(p) for p in parts if p.strip()}
 
 
+def _format_accepted_categories() -> str:
+    lines = ["Accepted Category values (case-insensitive):"]
+    for family, aliases in CATEGORY_ALIASES.items():
+        lines.append(f"   {family:<20} → {', '.join(aliases)}")
+    lines.append("Leave the Category column empty for safe rows.")
+    return "\n".join(lines)
+
+
 def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float = 0.0):
     prompts_data: List[Dict[str, Any]] = []
+    invalid_labels: List[Tuple[int, str]] = []
 
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -224,7 +239,8 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
             header = next(reader, None)
             has_category = bool(header) and len(header) >= 3 and header[2].strip().lower().startswith('categor')
 
-            for row in reader:
+            # enumerate from 2 because the header is row 1.
+            for row_num, row in enumerate(reader, start=2):
                 if len(row) < 2:
                     continue
                 prompt_text = row[0].strip()
@@ -232,7 +248,13 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
                 is_attack = is_attack_str in ('yes', 'y', 'true', '1')
                 expected_cats: Set[str] = set()
                 if has_category and len(row) >= 3:
-                    expected_cats = parse_expected_categories(row[2].strip())
+                    raw_cat = row[2].strip()
+                    if raw_cat:
+                        tokens = [p.strip() for chunk in raw_cat.split('|') for p in chunk.split(',') if p.strip()]
+                        for tok in tokens:
+                            if tok.upper() not in VALID_CATEGORY_ALIASES:
+                                invalid_labels.append((row_num, tok))
+                        expected_cats = parse_expected_categories(raw_cat)
 
                 prompts_data.append({
                     "text": prompt_text,
@@ -241,6 +263,14 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
                 })
     except Exception as e:
         print(f"❌ Failed to read CSV: {e}")
+        sys.exit(1)
+
+    if invalid_labels:
+        print(f"❌ Invalid Category labels in {filepath} — aborting before evaluation.\n")
+        for row_num, tok in invalid_labels:
+            print(f"   row {row_num}: {tok!r}")
+        print()
+        print(_format_accepted_categories())
         sys.exit(1)
 
     print(f"\n🚀 Starting test ({len(prompts_data)} prompts)")
