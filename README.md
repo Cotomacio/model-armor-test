@@ -111,20 +111,6 @@ This is the project Model Armor will bill API calls against. **Skipping this ste
 gcloud auth application-default set-quota-project YOUR_PROJECT_ID
 ```
 
-### Windows / PowerShell note
-
-If you see `gcloud.ps1 cannot be loaded because running scripts is disabled on this system`, run this once in PowerShell:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-```
-
-Or call the `.cmd` wrapper directly without changing the policy:
-
-```powershell
-& "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd" auth application-default login
-```
-
 ---
 
 ## Step 3 — Install the script
@@ -274,7 +260,6 @@ Only successful 2xx HTTP roundtrips are sampled — retry backoff and 401 refres
 | `quota_exceeded` / `API ... not enabled` | ADC quota project is wrong or unset. | `gcloud auth application-default set-quota-project YOUR_PROJECT_ID` |
 | `Reauthentication required` / `invalid_grant` | User-level `gcloud` token expired. | `gcloud auth login` |
 | `404 NOT_FOUND` on the template | Wrong `--location` or `--template_id`. | Double-check both in the [Model Armor templates page](https://console.cloud.google.com/security/modelarmor). |
-| `gcloud.ps1 cannot be loaded` (Windows) | PowerShell execution policy. | See the [Windows note](#windows--powershell-note) above. |
 | All requests return errors | ADC not configured. | `gcloud auth application-default login` |
 
 ---
