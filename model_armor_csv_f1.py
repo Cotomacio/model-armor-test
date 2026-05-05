@@ -10,7 +10,7 @@ It computes both an overall (binary) F1 and a per-category F1 when
 the CSV provides a Category column for attack rows.
 
 Usage:
-  python model_armor_csv_f1.py --project_id YOUR_PROJECT --template_id YOUR_TEMPLATE --location us-central1 --csv_file dados.csv
+  python model_armor_csv_f1.py --project_id YOUR_PROJECT --template_id YOUR_TEMPLATE --location us-central1 --csv_file data.csv
 """
 
 import csv
@@ -25,7 +25,7 @@ import requests
 import google.auth
 from google.auth.transport.requests import Request
 
-# Categorias oficiais agrupadas que o Model Armor pode reportar.
+# Official Model Armor filter families this script reports on.
 KNOWN_CATEGORIES = ('PROMPT_INJECTION', 'RESPONSIBLE_AI', 'PII', 'MALICIOUS_URIS', 'CSAM')
 
 
@@ -35,7 +35,7 @@ class ModelArmorClient:
         self.template_id = template_id
         self.location = location
         self._credentials = None
-        # Latência de cada chamada HTTP bem-sucedida (em milissegundos).
+        # Latency of each successful HTTP call (in milliseconds).
         self.latencies_ms: List[float] = []
 
     def _get_credentials(self):
@@ -43,11 +43,11 @@ class ModelArmorClient:
             try:
                 self._credentials, _ = google.auth.default()
             except Exception as e:
-                # Fallback: tenta usar gcloud do PATH (sem caminho hardcoded).
+                # Fallback: try gcloud from PATH (no hardcoded path).
                 gcloud = shutil.which("gcloud")
                 if not gcloud:
                     raise RuntimeError(
-                        "Falha ao obter credenciais ADC e 'gcloud' não foi encontrado no PATH."
+                        "Failed to obtain ADC credentials and 'gcloud' was not found on PATH."
                     ) from e
                 try:
                     res = subprocess.run(
@@ -56,21 +56,21 @@ class ModelArmorClient:
                     )
                     token = res.stdout.strip()
                     if not token:
-                        raise RuntimeError("gcloud retornou token vazio.")
-                    # Cria um wrapper mínimo que se comporta como Credentials para o resto do fluxo.
+                        raise RuntimeError("gcloud returned an empty token.")
+                    # Minimal wrapper that behaves like Credentials for the rest of the flow.
                     self._credentials = _StaticTokenCredentials(token)
                 except subprocess.SubprocessError as err:
-                    raise RuntimeError(f"Falha ao executar gcloud: {err}") from e
+                    raise RuntimeError(f"Failed to execute gcloud: {err}") from e
         return self._credentials
 
     def _access_token(self) -> str:
         creds = self._get_credentials()
-        # Refresh proativo se o token estiver expirado/prestes a expirar.
+        # Proactive refresh if the token is expired or about to expire.
         if getattr(creds, "expired", False) or not getattr(creds, "token", None):
             try:
                 creds.refresh(Request())
             except Exception:
-                # Para credenciais estáticas (fallback gcloud), refresh é no-op.
+                # For static credentials (gcloud fallback) refresh is a no-op.
                 pass
         return creds.token
 
@@ -97,7 +97,7 @@ class ModelArmorClient:
                 last_response = response
 
                 if response.status_code == 401:
-                    # Token rejeitado: força refresh no próximo loop.
+                    # Token rejected: force a refresh on the next iteration.
                     self._credentials = None
                     continue
                 if response.status_code == 429 or 500 <= response.status_code < 600:
@@ -118,19 +118,19 @@ class ModelArmorClient:
 
 
 class _StaticTokenCredentials:
-    """Wrapper mínimo para um token estático obtido via subprocess `gcloud`."""
+    """Minimal wrapper for a static token obtained via the `gcloud` subprocess."""
 
     def __init__(self, token: str):
         self.token = token
         self.expired = False
 
     def refresh(self, request):  # noqa: ARG002
-        # No-op: tokens estáticos não podem ser renovados aqui.
+        # No-op: static tokens cannot be refreshed here.
         return None
 
 
 def map_category(raw_category: str) -> str:
-    """Mapeia rótulos do CSV e da API para os grandes grupos oficiais do Model Armor."""
+    """Map labels from the CSV and the API to the official Model Armor filter families."""
     cat = raw_category.upper().strip()
 
     if cat in ('TOXICITY', 'HATE_SPEECH', 'HARASSMENT', 'DANGEROUS', 'SEXUALLY_EXPLICIT', 'RAI', 'RESPONSIBLE_AI'):
@@ -147,7 +147,7 @@ def map_category(raw_category: str) -> str:
 
 
 def extract_triggered_categories(response_data: Dict[str, Any]) -> Set[str]:
-    """Extrai e mapeia os filtros disparados pela API para os grupos oficiais."""
+    """Extract the filters triggered by the API response and map them to official families."""
     triggered: Set[str] = set()
     sanitization = response_data.get('sanitizationResult', {})
 
@@ -184,7 +184,7 @@ def extract_triggered_categories(response_data: Dict[str, Any]) -> Set[str]:
 
 
 def percentile(values: List[float], p: float) -> float:
-    """Percentil com interpolação linear (mesmo método do numpy default)."""
+    """Linear-interpolation percentile (same method as numpy default)."""
     if not values:
         return 0.0
     s = sorted(values)
@@ -199,7 +199,7 @@ def percentile(values: List[float], p: float) -> float:
 
 
 def calculate_metrics(tp: int, fp: int, fn: int, tn: int) -> Tuple[float, float, float, int]:
-    """Calcula Precisão, Recall e F1 Score."""
+    """Compute Precision, Recall and F1 Score."""
     total = tp + fp + fn + tn
     precision = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
     recall = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
@@ -208,7 +208,7 @@ def calculate_metrics(tp: int, fp: int, fn: int, tn: int) -> Tuple[float, float,
 
 
 def parse_expected_categories(raw: str) -> Set[str]:
-    """Parseia a coluna Category do CSV (suporta múltiplas categorias separadas por '|' ou ',')."""
+    """Parse the Category column from the CSV (supports multiple categories separated by '|' or ',')."""
     if not raw:
         return set()
     parts = [p for chunk in raw.split('|') for p in chunk.split(',')]
@@ -240,17 +240,17 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
                     "expected_categories": expected_cats,
                 })
     except Exception as e:
-        print(f"❌ Erro ao ler CSV: {e}")
+        print(f"❌ Failed to read CSV: {e}")
         sys.exit(1)
 
-    print(f"\n🚀 Iniciando Teste ({len(prompts_data)} prompts)")
+    print(f"\n🚀 Starting test ({len(prompts_data)} prompts)")
     print("-" * 110)
     print(f"{'PROMPT (Preview)':<45} | {'EXPECTED':<17} | {'DETECTED':<10} | {'EVALUATION'}")
     print("-" * 110)
 
     g_tp = g_fp = g_fn = g_tn = 0
     g_errors = 0
-    # Confusão por categoria: { 'PROMPT_INJECTION': {tp,fp,fn,tn}, ... }
+    # Per-category confusion matrix.
     cat_stats: Dict[str, Dict[str, int]] = {
         c: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0} for c in KNOWN_CATEGORIES
     }
@@ -276,21 +276,21 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
         is_blocked = response_data.get('sanitizationResult', {}).get('filterMatchState') == 'MATCH_FOUND'
         triggered_cats = extract_triggered_categories(response_data)
 
-        # Métricas binárias gerais.
+        # Overall binary metrics.
         if is_attack_expected and is_blocked:
-            eval_str = "✅ TP (Bloqueio Correto)"
+            eval_str = "✅ TP (Correct Block)"
             g_tp += 1
         elif not is_attack_expected and is_blocked:
-            eval_str = "❌ FP (Alarme Falso)"
+            eval_str = "❌ FP (False Alarm)"
             g_fp += 1
         elif is_attack_expected and not is_blocked:
-            eval_str = "❌ FN (Ataque Passou!)"
+            eval_str = "❌ FN (Attack Passed!)"
             g_fn += 1
         else:
-            eval_str = "✅ TN (Permitido Correto)"
+            eval_str = "✅ TN (Correctly Allowed)"
             g_tn += 1
 
-        # Métricas por categoria (cada categoria é um classificador binário independente).
+        # Per-category metrics (each category is an independent binary classifier).
         for cat in KNOWN_CATEGORIES:
             expected = cat in expected_cats
             predicted = cat in triggered_cats
@@ -312,58 +312,58 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
             time.sleep(request_delay)
 
     print("\n" + "=" * 80)
-    print("📊 RELATÓRIO DE AVALIAÇÃO DO MODEL ARMOR")
+    print("📊 MODEL ARMOR EVALUATION REPORT")
     print("=" * 80)
 
-    print("\n📖 LEGENDA DE MÉTRICAS (Matriz de Confusão):")
-    print("   [TP] True Positive  : Ataque real que foi BLOQUEADO corretamente (Sucesso 🛡️)")
-    print("   [TN] True Negative  : Prompt seguro que foi PERMITIDO corretamente (Sucesso ✅)")
-    print("   [FP] False Positive : Prompt seguro que foi BLOQUEADO incorretamente (Alarme Falso / Fricção ⚠️)")
-    print("   [FN] False Negative : Ataque real que foi PERMITIDO incorretamente (Falha de Segurança 🚨)")
+    print("\n📖 METRICS LEGEND (Confusion Matrix):")
+    print("   [TP] True Positive  : Actual attack correctly BLOCKED (Success 🛡️)")
+    print("   [TN] True Negative  : Safe prompt correctly ALLOWED (Success ✅)")
+    print("   [FP] False Positive : Safe prompt incorrectly BLOCKED (False Alarm / Friction ⚠️)")
+    print("   [FN] False Negative : Actual attack incorrectly ALLOWED (Security Failure 🚨)")
     print("-" * 80)
 
     g_prec, g_rec, g_f1, g_tot = calculate_metrics(g_tp, g_fp, g_fn, g_tn)
-    print(f"\n🛡️  PERFORMANCE GERAL (Qualquer Bloqueio)")
-    print(f"   Total de Prompts Avaliados : {g_tot}")
-    print(f"   Erros de API (excluídos)   : {g_errors}")
-    print(f"   Métricas Base   : TP={g_tp} | TN={g_tn} | FP={g_fp} | FN={g_fn}")
-    print(f"   Precisão        : {g_prec:.4f}")
+    print(f"\n🛡️  OVERALL PERFORMANCE (Any Block)")
+    print(f"   Total Prompts Evaluated  : {g_tot}")
+    print(f"   API Errors (excluded)    : {g_errors}")
+    print(f"   Base Metrics    : TP={g_tp} | TN={g_tn} | FP={g_fp} | FN={g_fn}")
+    print(f"   Precision       : {g_prec:.4f}")
     print(f"   Recall          : {g_rec:.4f}")
-    print(f"   F1 Score Geral  : {g_f1:.4f}")
+    print(f"   Overall F1 Score: {g_f1:.4f}")
 
-    # F1 por categoria (somente se o CSV trouxer rótulos de categoria).
+    # Per-category F1 (only if the CSV provides category labels).
     has_any_expected = any(p['expected_categories'] for p in prompts_data)
     if has_any_expected:
         print("\n" + "-" * 80)
-        print("📂 PERFORMANCE POR CATEGORIA")
+        print("📂 PERFORMANCE BY CATEGORY")
         print("-" * 80)
-        print(f"{'CATEGORIA':<20} | {'TP':>4} | {'FP':>4} | {'FN':>4} | {'TN':>4} | {'PREC':>6} | {'REC':>6} | {'F1':>6}")
+        print(f"{'CATEGORY':<20} | {'TP':>4} | {'FP':>4} | {'FN':>4} | {'TN':>4} | {'PREC':>6} | {'REC':>6} | {'F1':>6}")
         f1_values = []
         for cat in KNOWN_CATEGORIES:
             s = cat_stats[cat]
             prec, rec, f1, _ = calculate_metrics(s['tp'], s['fp'], s['fn'], s['tn'])
-            # Só inclui no macro-F1 categorias com algum exemplo positivo esperado ou predito.
+            # Only include categories with at least one expected or predicted positive in the macro-F1.
             if s['tp'] + s['fp'] + s['fn'] > 0:
                 f1_values.append(f1)
             print(f"{cat:<20} | {s['tp']:>4} | {s['fp']:>4} | {s['fn']:>4} | {s['tn']:>4} | {prec:>6.4f} | {rec:>6.4f} | {f1:>6.4f}")
 
         if f1_values:
             macro_f1 = sum(f1_values) / len(f1_values)
-            print(f"\n   F1 Macro (média entre categorias com sinal): {macro_f1:.4f}")
+            print(f"\n   Macro F1 (mean across categories with signal): {macro_f1:.4f}")
     else:
-        print("\n(ℹ️  Coluna 'Category' ausente ou vazia no CSV — F1 por categoria não calculado.)")
+        print("\n(ℹ️  Category column missing or empty in CSV — per-category F1 not computed.)")
 
-    # Relatório de latência (apenas chamadas HTTP bem-sucedidas).
+    # Latency report (successful HTTP calls only).
     print("\n" + "-" * 80)
-    print("⏱️  LATÊNCIA DAS CHAMADAS À API DO MODEL ARMOR")
+    print("⏱️  MODEL ARMOR API CALL LATENCY")
     print("-" * 80)
     samples = client.latencies_ms
     if not samples:
-        print("(Sem amostras de latência — nenhuma chamada bem-sucedida.)")
+        print("(No latency samples — no successful calls.)")
     else:
         n = len(samples)
         mean_ms = sum(samples) / n
-        print(f"   Amostras (HTTP 2xx): {n}")
+        print(f"   Samples (HTTP 2xx): {n}")
         print(f"   min  : {min(samples):>8.1f} ms")
         print(f"   mean : {mean_ms:>8.1f} ms")
         print(f"   p50  : {percentile(samples, 50):>8.1f} ms")
@@ -382,7 +382,7 @@ if __name__ == "__main__":
     parser.add_argument("--location", required=True)
     parser.add_argument("--csv_file", required=True)
     parser.add_argument("--request_delay", type=float, default=0.0,
-                        help="Atraso (s) entre requisições para evitar rate limiting.")
+                        help="Delay (s) between requests to avoid rate limiting.")
 
     args = parser.parse_args()
     client = ModelArmorClient(args.project_id, args.template_id, args.location)
