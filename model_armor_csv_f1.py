@@ -42,10 +42,11 @@ VALID_CATEGORY_ALIASES = frozenset(a for aliases in CATEGORY_ALIASES.values() fo
 
 
 class ModelArmorClient:
-    def __init__(self, project_id: str, template_id: str, location: str):
+    def __init__(self, project_id: str, template_id: str, location: str, verbose: bool = False):
         self.project_id = project_id
         self.template_id = template_id
         self.location = location
+        self.verbose = verbose
         self._credentials = None
         # Latency of each successful HTTP call (in milliseconds).
         self.latencies_ms: List[float] = []
@@ -88,7 +89,7 @@ class ModelArmorClient:
 
     def sanitize(self, prompt: str) -> Dict[str, Any]:
         url = (
-            f"https://modelarmor.{self.location}.rep.googleapis.com/v1alpha/"
+            f"https://modelarmor.{self.location}.rep.googleapis.com/v1/"
             f"projects/{self.project_id}/locations/{self.location}/"
             f"templates/{self.template_id}:sanitizeUserPrompt"
         )
@@ -96,6 +97,9 @@ class ModelArmorClient:
 
         backoff = 1.0
         last_response = None
+        last_exception_type: str = ""
+        last_exception_msg: str = ""
+
         for attempt in range(4):
             try:
                 token = self._access_token()
@@ -107,6 +111,9 @@ class ModelArmorClient:
                 response = requests.post(url, headers=headers, json=payload, timeout=30)
                 latency_ms = (time.perf_counter() - start) * 1000.0
                 last_response = response
+
+                if self.verbose:
+                    print(f"   [verbose] attempt {attempt + 1}/4 → HTTP {response.status_code} ({latency_ms:.0f} ms)")
 
                 if response.status_code == 401:
                     # Token rejected: force a refresh on the next iteration.
@@ -120,13 +127,31 @@ class ModelArmorClient:
                 response.raise_for_status()
                 self.latencies_ms.append(latency_ms)
                 return response.json()
-            except requests.RequestException:
+            except requests.RequestException as e:
+                last_exception_type = type(e).__name__
+                last_exception_msg = str(e)
+                if self.verbose:
+                    print(f"   [verbose] attempt {attempt + 1}/4 → {last_exception_type}: {last_exception_msg}")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
                 continue
 
-        status = last_response.status_code if last_response is not None else "no_response"
-        return {"is_error": True, "error_status": status}
+        # All attempts failed. Return rich diagnostic info for the caller.
+        if last_response is not None:
+            body = (last_response.text or "")[:500]
+            return {
+                "is_error": True,
+                "error_status": last_response.status_code,
+                "error_body": body,
+                "error_url": url,
+            }
+        return {
+            "is_error": True,
+            "error_status": "no_response",
+            "error_type": last_exception_type or "Unknown",
+            "error_message": last_exception_msg or "(no exception captured)",
+            "error_url": url,
+        }
 
 
 class _StaticTokenCredentials:
@@ -280,6 +305,7 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
 
     g_tp = g_fp = g_fn = g_tn = 0
     g_errors = 0
+    failed_prompts: List[Dict[str, Any]] = []
     # Per-category confusion matrix.
     cat_stats: Dict[str, Dict[str, int]] = {
         c: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0} for c in KNOWN_CATEGORIES
@@ -294,9 +320,22 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
 
         if response_data.get('is_error'):
             g_errors += 1
-            eval_str = f"⚠️  ERROR ({response_data.get('error_status')})"
+            err_status = response_data.get('error_status')
+            if err_status == 'no_response':
+                err_short = f"no_response: {response_data.get('error_type', '?')}"
+            else:
+                err_short = f"HTTP {err_status}"
+            eval_str = f"⚠️  ERROR ({err_short})"
             exp_str = "ATTACK" if is_attack_expected else "SAFE"
             det_str = "—"
+            failed_prompts.append({
+                'prompt': prompt,
+                'status': err_status,
+                'type': response_data.get('error_type'),
+                'message': response_data.get('error_message'),
+                'body': response_data.get('error_body'),
+                'url': response_data.get('error_url'),
+            })
             prompt_preview = (prompt.replace('\n', ' ')[:42] + '...') if len(prompt) > 42 else prompt.replace('\n', ' ')
             print(f"{prompt_preview:<45} | {exp_str:<17} | {det_str:<10} | {eval_str}")
             if request_delay:
@@ -402,7 +441,60 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
         print(f"   p99  : {percentile(samples, 99):>8.1f} ms")
         print(f"   max  : {max(samples):>8.1f} ms")
 
-    print("=" * 80)
+    # Per-failure diagnostics (only printed when there were errors).
+    if failed_prompts:
+        print("\n" + "=" * 80)
+        print(f"🔍 ERROR DIAGNOSTICS  ({len(failed_prompts)} failed prompt(s))")
+        print("=" * 80)
+        for i, f in enumerate(failed_prompts, start=1):
+            preview = f['prompt'].replace('\n', ' ')
+            preview = (preview[:80] + '...') if len(preview) > 80 else preview
+            print(f"\n#{i}  Prompt : {preview!r}")
+
+            if f['status'] == 'no_response':
+                print(f"    Result : No HTTP response after 4 attempts")
+                print(f"    Type   : {f.get('type') or '(unknown)'}")
+                if f.get('message'):
+                    msg = f['message']
+                    if len(msg) > 400:
+                        msg = msg[:400] + '...'
+                    print(f"    Detail : {msg}")
+                print(f"    URL    : {f.get('url', '(unknown)')}")
+                print(f"\n    Likely causes:")
+                print(f"      • Invalid --location value. Multi-region: us, eu.")
+                print(f"        Single-region: us-central1, us-east1, us-east4, us-west1,")
+                print(f"        europe-west1/2/3/4/9, europe-southwest1, asia-northeast1/3,")
+                print(f"        asia-south1, asia-southeast1, australia-southeast2,")
+                print(f"        northamerica-northeast2.")
+                print(f"      • Network / firewall blocking outbound HTTPS to *.googleapis.com.")
+                print(f"      • DNS resolution failure (check the URL above is reachable).")
+                print(f"      • If running inside a VPC, configure Private Service Connect.")
+                continue
+
+            print(f"    Result : HTTP {f['status']}")
+            if f.get('body'):
+                print(f"    Body   : {f['body']}")
+            print(f"    URL    : {f.get('url', '(unknown)')}")
+
+            print(f"\n    Likely causes:")
+            if f['status'] == 401:
+                print(f"      • ADC token rejected. Run: gcloud auth application-default login")
+            elif f['status'] == 403:
+                print(f"      • Account lacks roles/modelarmor.user on this project.")
+                print(f"      • ADC quota project mismatch. Run:")
+                print(f"        gcloud auth application-default set-quota-project YOUR_PROJECT_ID")
+            elif f['status'] == 404:
+                print(f"      • --location or --template_id is wrong, or the template was")
+                print(f"        deleted. Verify at:")
+                print(f"        https://console.cloud.google.com/security/modelarmor")
+            elif f['status'] == 429:
+                print(f"      • Rate-limit. Re-run with --request_delay 0.5 (or higher).")
+            elif isinstance(f['status'], int) and 500 <= f['status'] < 600:
+                print(f"      • Transient Model Armor backend error. Retry later.")
+            else:
+                print(f"      • Inspect the response body above for an explicit reason field.")
+
+    print("\n" + "=" * 80)
 
 
 if __name__ == "__main__":
@@ -413,7 +505,9 @@ if __name__ == "__main__":
     parser.add_argument("--csv_file", required=True)
     parser.add_argument("--request_delay", type=float, default=0.0,
                         help="Delay (s) between requests to avoid rate limiting.")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print per-attempt HTTP status / exception details for every request.")
 
     args = parser.parse_args()
-    client = ModelArmorClient(args.project_id, args.template_id, args.location)
+    client = ModelArmorClient(args.project_id, args.template_id, args.location, verbose=args.verbose)
     run_csv_test(client, args.csv_file, request_delay=args.request_delay)

@@ -69,11 +69,22 @@ A template defines which filters (`pi_and_jailbreak`, `rai`, `sdp`, `csam`, `mal
 
 1. Open [Cloud Console → Security → Model Armor → Templates](https://console.cloud.google.com/security/modelarmor).
 2. Click **Create template**.
-3. Pick a **template ID** (e.g. `ma-utility`) and a **region** (e.g. `us-central1`).
+3. Pick a **template ID** (e.g. `ma-utility`) and a **location** (see supported values below).
 4. Enable the filters you want to evaluate. To exercise every category in this script, enable all of them.
 5. Save.
 
 You can also create a template via `gcloud` or the REST API — see the [Model Armor docs](https://cloud.google.com/security-command-center/docs/model-armor-overview).
+
+**Supported locations** (use this value for both the template and the script's `--location` flag):
+
+| Type | Values |
+|---|---|
+| **Multi-region** | `us`, `eu` |
+| **Single-region (Americas)** | `us-central1`, `us-east1`, `us-east4`, `us-west1`, `northamerica-northeast2` |
+| **Single-region (Europe)** | `europe-west1`, `europe-west2`, `europe-west3`, `europe-west4`, `europe-west9`, `europe-southwest1` |
+| **Single-region (Asia-Pacific)** | `asia-northeast1`, `asia-northeast3`, `asia-south1`, `asia-southeast1`, `australia-southeast2` |
+
+The same URL pattern (`modelarmor.{LOCATION}.rep.googleapis.com`) is used for both single-region and multi-region — the script handles both transparently. See [Model Armor data residency](https://cloud.google.com/model-armor/data-residency) for the authoritative list.
 
 ### 1.5 Grant yourself Model Armor permissions
 
@@ -240,6 +251,29 @@ Each category is treated as an **independent binary classifier** because Model A
 
 Only successful 2xx HTTP roundtrips are sampled — retry backoff and 401 refreshes are excluded so the numbers reflect Model Armor's actual API latency.
 
+### 4. Error diagnostics (only printed when there were errors)
+
+If any prompt fails, a final section breaks down each failure:
+
+```
+🔍 ERROR DIAGNOSTICS  (1 failed prompt(s))
+================================================================================
+
+#1  Prompt : 'Translate the following text to French: ...'
+    Result : No HTTP response after 4 attempts
+    Type   : ConnectionError
+    Detail : HTTPSConnectionPool(host='modelarmor.foo.rep.googleapis.com', ...) Failed to resolve ...
+    URL    : https://modelarmor.foo.rep.googleapis.com/v1/projects/.../templates/...
+
+    Likely causes:
+      • Invalid --location value. Multi-region: us, eu. Single-region: us-central1, ...
+      • Network / firewall blocking outbound HTTPS to *.googleapis.com.
+      • DNS resolution failure (check the URL above is reachable).
+      • If running inside a VPC, configure Private Service Connect.
+```
+
+For HTTP errors (401/403/404/429/5xx), the body of the response is included along with a one-line cause hint. For deeper inspection, re-run with `--verbose` to see per-attempt logs.
+
 ---
 
 ## CLI reference
@@ -251,6 +285,7 @@ Only successful 2xx HTTP roundtrips are sampled — retry backoff and 401 refres
 | `--location` | yes | — | Template region (e.g. `us-central1`). |
 | `--csv_file` | yes | — | Path to the labeled CSV. |
 | `--request_delay` | no | `0.0` | Seconds to sleep between requests (helps avoid rate limits). |
+| `--verbose` | no | off | Print per-attempt HTTP status / exception details for every request. Use this when diagnosing failures. |
 
 ---
 
