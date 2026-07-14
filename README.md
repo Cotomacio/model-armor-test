@@ -264,6 +264,10 @@ Each category is treated as an **independent binary classifier** because Model A
 
 **SKIP** counts prompts where that filter returned `EXECUTION_SKIPPED` — the filter never evaluated the prompt (typically because it exceeded the filter's token limit). Skipped prompts are **excluded from that category's confusion matrix**: treating "the filter didn't run" as "the filter found nothing" would silently inflate FN/TN.
 
+A row rendered as `—   (not configured in template)` means the filter never appeared in any API response — it is not enabled in the template. Those rows carry no signal and are **not** True Negatives. If your dataset labels rows with a category whose filter is not configured, the row gets an explicit warning (`N prompt(s) expected this category!`), since those expectations can never be met.
+
+To print only the binary report, pass `--no_category_report`.
+
 ### 3. API latency
 
 ```
@@ -314,6 +318,7 @@ For HTTP errors (401/403/404/429/5xx), the body of the response is included alon
 | `--csv_file` | yes | — | Path to the labeled CSV. |
 | `--request_delay` | no | `0.0` | Seconds to sleep between requests (helps avoid rate limits). |
 | `--verbose` | no | off | Print per-attempt HTTP status / exception details for every request. Use this when diagnosing failures. |
+| `--no_category_report` | no | off | Suppress the per-category performance section (binary report only). |
 
 ---
 

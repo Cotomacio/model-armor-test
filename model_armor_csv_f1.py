@@ -202,17 +202,22 @@ def map_category(raw_category: str) -> str:
 
 
 def extract_filter_states(response_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Per-category filter outcome: {'match': bool, 'skipped': bool, 'confidence': str|None}.
+    """Per-category filter outcome:
+    {'match': bool, 'skipped': bool, 'absent': bool, 'confidence': str|None}.
 
     'skipped' means the filter returned EXECUTION_SKIPPED (e.g. the prompt
     exceeded its token limit): the filter did NOT evaluate the prompt, which is
-    different from evaluating it and finding no match."""
+    different from evaluating it and finding no match.
+    'absent' means the filter did not appear in the API response at all —
+    typically because it is not configured in the template. Treating that as a
+    True Negative would disguise "never ran" as "ran and correctly allowed"."""
     filter_results = response_data.get('sanitizationResult', {}).get('filterResults', {})
 
     def state(d: Dict[str, Any]) -> Dict[str, Any]:
         return {
             'match': d.get('matchState') == 'MATCH_FOUND',
             'skipped': d.get('executionState') == 'EXECUTION_SKIPPED',
+            'absent': not d,
             'confidence': d.get('confidenceLevel'),
         }
 
@@ -240,6 +245,7 @@ def extract_filter_states(response_data: Dict[str, Any]) -> Dict[str, Dict[str, 
     states['PII'] = {
         'match': 'MATCH_FOUND' in (inspect.get('matchState'), deidentify.get('matchState')),
         'skipped': 'EXECUTION_SKIPPED' in (inspect.get('executionState'), deidentify.get('executionState')),
+        'absent': not sdp,
         'confidence': None,
     }
 
@@ -356,7 +362,8 @@ def _format_accepted_categories() -> str:
     return "\n".join(lines)
 
 
-def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float = 0.0):
+def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float = 0.0,
+                 category_report: bool = True):
     prompts_data: List[Dict[str, Any]] = []
     invalid_labels: List[Tuple[int, str]] = []
 
@@ -445,9 +452,12 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
     g_prompts_with_skips = 0
     failed_prompts: List[Dict[str, Any]] = []
     # Per-category confusion matrix. 'skip' counts prompts the filter did not
-    # evaluate (EXECUTION_SKIPPED) — excluded from that category's matrix.
+    # evaluate (EXECUTION_SKIPPED); 'na' counts responses where the filter was
+    # absent (not configured in the template). Both are excluded from the
+    # matrix. 'exp' counts prompts whose ground truth expected the category.
     cat_stats: Dict[str, Dict[str, int]] = {
-        c: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'skip': 0} for c in KNOWN_CATEGORIES
+        c: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'skip': 0, 'na': 0, 'exp': 0}
+        for c in KNOWN_CATEGORIES
     }
 
     for p_data in prompts_data:
@@ -501,6 +511,14 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
         # Per-category metrics (each category is an independent binary classifier).
         for cat in KNOWN_CATEGORIES:
             st = filter_states[cat]
+            if cat in expected_cats:
+                cat_stats[cat]['exp'] += 1
+            if st['absent']:
+                # Filter missing from the response (not configured in the
+                # template) — counting it as TN would disguise "never ran"
+                # as "ran and correctly allowed".
+                cat_stats[cat]['na'] += 1
+                continue
             if st['skipped']:
                 # The filter never evaluated this prompt — neither a hit nor a miss.
                 cat_stats[cat]['skip'] += 1
@@ -561,19 +579,38 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
 
     # Per-category F1 (only if the CSV provides category labels).
     has_any_expected = any(p['expected_categories'] for p in prompts_data)
-    if has_any_expected:
+    if not category_report:
+        print("\n(ℹ️  Per-category report suppressed via --no_category_report.)")
+    elif has_any_expected:
         print("\n" + "-" * 80)
         print("📂 PERFORMANCE BY CATEGORY")
         print("-" * 80)
         print(f"{'CATEGORY':<20} | {'TP':>4} | {'FP':>4} | {'FN':>4} | {'TN':>4} | {'SKIP':>4} | {'PREC':>6} | {'REC':>6} | {'F1':>6}")
         f1_values = []
+        any_not_configured = False
         for cat in KNOWN_CATEGORIES:
             s = cat_stats[cat]
+            evaluated = s['tp'] + s['fp'] + s['fn'] + s['tn'] + s['skip']
+            if evaluated == 0 and s['na'] > 0:
+                # The filter never appeared in any response: not configured in
+                # the template. Print dashes instead of a bogus TN row.
+                any_not_configured = True
+                d = '—'
+                line = (f"{cat:<20} | {d:>4} | {d:>4} | {d:>4} | {d:>4} | {d:>4} | "
+                        f"{d:>6} | {d:>6} | {d:>6}   (not configured in template)")
+                if s['exp'] > 0:
+                    line += f" ⚠️  {s['exp']} prompt(s) expected this category!"
+                print(line)
+                continue
             prec, rec, f1, _ = calculate_metrics(s['tp'], s['fp'], s['fn'], s['tn'])
             # Only include categories with at least one expected or predicted positive in the macro-F1.
             if s['tp'] + s['fp'] + s['fn'] > 0:
                 f1_values.append(f1)
-            print(f"{cat:<20} | {s['tp']:>4} | {s['fp']:>4} | {s['fn']:>4} | {s['tn']:>4} | {s['skip']:>4} | {prec:>6.4f} | {rec:>6.4f} | {f1:>6.4f}")
+            line = (f"{cat:<20} | {s['tp']:>4} | {s['fp']:>4} | {s['fn']:>4} | {s['tn']:>4} | "
+                    f"{s['skip']:>4} | {prec:>6.4f} | {rec:>6.4f} | {f1:>6.4f}")
+            if s['na']:
+                line += f"   (absent in {s['na']} response(s))"
+            print(line)
 
         if f1_values:
             macro_f1 = sum(f1_values) / len(f1_values)
@@ -583,6 +620,10 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
             print("\n   ⚠️  SKIP = the filter returned EXECUTION_SKIPPED (did not evaluate the")
             print("      prompt, e.g. token limit exceeded). Skipped prompts are excluded from")
             print("      that category's confusion matrix — they are neither hits nor misses.")
+        if any_not_configured:
+            print("\n   ℹ️  '—' = the filter never appeared in any API response, i.e. it is not")
+            print("      configured in this template. These rows carry no signal — they are")
+            print("      not True Negatives.")
     else:
         print("\n(ℹ️  Category column missing or empty in CSV — per-category F1 not computed.)")
 
@@ -671,7 +712,10 @@ if __name__ == "__main__":
                         help="Delay (s) between requests to avoid rate limiting.")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-attempt HTTP status / exception details for every request.")
+    parser.add_argument("--no_category_report", action="store_true",
+                        help="Suppress the per-category performance section (binary report only).")
 
     args = parser.parse_args()
     client = ModelArmorClient(args.project_id, args.template_id, args.location, verbose=args.verbose)
-    run_csv_test(client, args.csv_file, request_delay=args.request_delay)
+    run_csv_test(client, args.csv_file, request_delay=args.request_delay,
+                 category_report=not args.no_category_report)
