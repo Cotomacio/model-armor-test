@@ -3,7 +3,8 @@
 A Python utility that benchmarks **Google Cloud Model Armor** against a labeled prompt dataset. For each prompt it sends a `sanitizeUserPrompt` request to your Model Armor template, compares the API decision to the ground-truth label, and reports:
 
 - Binary **Precision / Recall / F1 Score** (attack vs. safe).
-- **Per-category** confusion matrix and F1 across the official Model Armor filter families (`PROMPT_INJECTION`, `RESPONSIBLE_AI`, `PII`, `MALICIOUS_URIS`, `CSAM`).
+- **Per-category** confusion matrix and F1 across the official Model Armor filter families (`PROMPT_INJECTION`, `RESPONSIBLE_AI`, `PII`, `MALICIOUS_URIS`, `CSAM`), with a `SKIP` column for filters that returned `EXECUTION_SKIPPED`.
+- The **template's exact filter configuration** printed in the report header, plus per-prompt matched filters with their **confidence levels**.
 - **Latency percentiles** (`p50 / p90 / p95 / p99`) for the API calls themselves.
 
 > Not an official Google product. Purely an evaluation harness.
@@ -177,6 +178,12 @@ Prompt,Is_Attack,Category
 
 > If you omit the `Category` column entirely, the script still produces the binary F1 report — it just won't compute per-category metrics.
 
+Additional data hygiene rules:
+
+- **Columns are matched by header name** (`Prompt`, `Is_Attack`, `Category`), so column order doesn't matter. The script exits with an error if `Prompt` or `Is_Attack` is missing.
+- **Rows with an empty `Prompt` are skipped** (and counted in an informational message) instead of being sent to the API as billable "safe" prompts that would inflate TN.
+- **Oversized prompts are flagged upfront.** Each filter has a token limit (10,000 tokens for prompt injection, Responsible AI and CSAM; 130,000 for Sensitive Data Protection). Prompts estimated above a limit are listed before the run, because the affected filter returns `EXECUTION_SKIPPED` instead of a verdict — see the `SKIP` column below.
+
 ---
 
 ## Step 5 — Run the evaluation
@@ -204,7 +211,26 @@ python model_armor_csv_f1.py \
 
 ## Reading the report
 
-The report has three sections:
+### 0. Template configuration
+
+Before the run, the script fetches and prints the template's exact configuration, so every report is tied to the settings it was measured against:
+
+```
+🧩 TEMPLATE CONFIGURATION
+   Template : projects/my-project/locations/us/templates/my-template
+   Prompt injection & jailbreak : ENABLED (MEDIUM_AND_ABOVE)
+   Sensitive Data Protection    : BASIC mode
+     ⚠️  Basic mode only detects credit cards, financial account numbers,
+        GCP credentials/API keys and passwords (plus US SSN/ITIN in US
+        regions). Emails, phone numbers and country-specific IDs (e.g.
+        BRAZIL_CPF_NUMBER) require ADVANCED mode with a DLP inspect template.
+   Responsible AI               : HATE_SPEECH:HIGH, DANGEROUS:HIGH, ...
+   Metadata                     : enforcement=INSPECT_AND_BLOCK, filter_version=FILTER_VERSION_ALIAS_STABLE, multi_language=on
+```
+
+This matters when comparing runs: two reports are only comparable if this section matches. The SDP-mode warning exists because a very common evaluation mistake is testing region-specific PII (CPF, emails, phone numbers) against basic mode, which doesn't inspect those infoTypes at all — every row comes back as a False Negative.
+
+Each per-prompt line also shows **which filter matched and at what confidence**, e.g. `✅ TP (Correct Block)  [PROMPT_INJECTION:HIGH]`, and lists any skipped filters, e.g. `[SKIPPED: RESPONSIBLE_AI]`.
 
 ### 1. Overall (binary) performance
 
@@ -228,13 +254,15 @@ API errors are **excluded** from the matrix, not counted as TN.
 ### 2. Per-category performance
 
 ```
-CATEGORY             |   TP |   FP |   FN |   TN |   PREC |    REC |     F1
-PROMPT_INJECTION     |    2 |    2 |    0 |    5 | 0.5000 | 1.0000 | 0.6667
-RESPONSIBLE_AI       |    2 |    0 |    1 |    6 | 1.0000 | 0.6667 | 0.8000
-PII                  |    0 |    0 |    1 |    8 | 0.0000 | 0.0000 | 0.0000
+CATEGORY             |   TP |   FP |   FN |   TN | SKIP |   PREC |    REC |     F1
+PROMPT_INJECTION     |    2 |    2 |    0 |    5 |    0 | 0.5000 | 1.0000 | 0.6667
+RESPONSIBLE_AI       |    2 |    0 |    1 |    5 |    1 | 1.0000 | 0.6667 | 0.8000
+PII                  |    0 |    0 |    1 |    8 |    0 | 0.0000 | 0.0000 | 0.0000
 ```
 
 Each category is treated as an **independent binary classifier** because Model Armor can match multiple filters on a single prompt. The macro-F1 is the unweighted mean across categories that have at least one expected-or-predicted positive.
+
+**SKIP** counts prompts where that filter returned `EXECUTION_SKIPPED` — the filter never evaluated the prompt (typically because it exceeded the filter's token limit). Skipped prompts are **excluded from that category's confusion matrix**: treating "the filter didn't run" as "the filter found nothing" would silently inflate FN/TN.
 
 ### 3. API latency
 
