@@ -40,6 +40,17 @@ CATEGORY_ALIASES: Dict[str, Tuple[str, ...]] = {
 }
 VALID_CATEGORY_ALIASES = frozenset(a for aliases in CATEGORY_ALIASES.values() for a in aliases)
 
+# Per-filter token limits (https://cloud.google.com/model-armor/quotas). Prompts
+# above a filter's limit make that filter return EXECUTION_SKIPPED instead of a
+# verdict. Tokens are estimated as chars/4 — a warning heuristic, not an exact count.
+EST_CHARS_PER_TOKEN = 4
+FILTER_TOKEN_LIMITS = {
+    'PROMPT_INJECTION': 10_000,
+    'RESPONSIBLE_AI': 10_000,
+    'CSAM': 10_000,
+    'PII': 130_000,
+}
+
 
 class ModelArmorClient:
     def __init__(self, project_id: str, template_id: str, location: str, verbose: bool = False):
@@ -153,6 +164,19 @@ class ModelArmorClient:
             "error_url": url,
         }
 
+    def describe_template(self) -> Dict[str, Any]:
+        """Fetch the template definition so the report records the exact
+        configuration the numbers were measured against."""
+        url = (
+            f"https://modelarmor.{self.location}.rep.googleapis.com/v1/"
+            f"projects/{self.project_id}/locations/{self.location}/"
+            f"templates/{self.template_id}"
+        )
+        token = self._access_token()
+        response = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
 
 class _StaticTokenCredentials:
     """Minimal wrapper for a static token obtained via the `gcloud` subprocess."""
@@ -177,41 +201,119 @@ def map_category(raw_category: str) -> str:
     return cat
 
 
-def extract_triggered_categories(response_data: Dict[str, Any]) -> Set[str]:
-    """Extract the filters triggered by the API response and map them to official families."""
-    triggered: Set[str] = set()
-    sanitization = response_data.get('sanitizationResult', {})
+def extract_filter_states(response_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Per-category filter outcome: {'match': bool, 'skipped': bool, 'confidence': str|None}.
 
-    if sanitization.get('filterMatchState') != 'MATCH_FOUND':
-        return triggered
+    'skipped' means the filter returned EXECUTION_SKIPPED (e.g. the prompt
+    exceeded its token limit): the filter did NOT evaluate the prompt, which is
+    different from evaluating it and finding no match."""
+    filter_results = response_data.get('sanitizationResult', {}).get('filterResults', {})
 
-    filter_results = sanitization.get('filterResults', {})
+    def state(d: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'match': d.get('matchState') == 'MATCH_FOUND',
+            'skipped': d.get('executionState') == 'EXECUTION_SKIPPED',
+            'confidence': d.get('confidenceLevel'),
+        }
+
+    states: Dict[str, Dict[str, Any]] = {}
 
     pi_jb = filter_results.get('pi_and_jailbreak', {}).get('piAndJailbreakFilterResult', {})
-    if pi_jb.get('matchState') == 'MATCH_FOUND':
-        triggered.add('PROMPT_INJECTION')
+    states['PROMPT_INJECTION'] = state(pi_jb)
 
     rai = filter_results.get('rai', {}).get('raiFilterResult', {})
-    if rai.get('matchState') == 'MATCH_FOUND':
-        rai_types = rai.get('raiFilterTypeResults', {})
-        for _, rai_data in rai_types.items():
-            if rai_data.get('matchState') == 'MATCH_FOUND':
-                triggered.add('RESPONSIBLE_AI')
-                break
+    rai_state = state(rai)
+    matched_types = [
+        f"{rai_type}:{rai_data.get('confidenceLevel', '?')}"
+        for rai_type, rai_data in rai.get('raiFilterTypeResults', {}).items()
+        if rai_data.get('matchState') == 'MATCH_FOUND'
+    ]
+    rai_state['match'] = bool(matched_types)
+    rai_state['confidence'] = ','.join(matched_types) if matched_types else None
+    states['RESPONSIBLE_AI'] = rai_state
 
-    sdp = filter_results.get('sdp', {}).get('sdpFilterResult', {}).get('inspectResult', {})
-    if sdp.get('matchState') == 'MATCH_FOUND':
-        triggered.add('PII')
+    # SDP: basic templates answer in inspectResult; advanced templates with a
+    # deidentify template answer in deidentifyResult instead.
+    sdp = filter_results.get('sdp', {}).get('sdpFilterResult', {})
+    inspect = sdp.get('inspectResult', {})
+    deidentify = sdp.get('deidentifyResult', {})
+    states['PII'] = {
+        'match': 'MATCH_FOUND' in (inspect.get('matchState'), deidentify.get('matchState')),
+        'skipped': 'EXECUTION_SKIPPED' in (inspect.get('executionState'), deidentify.get('executionState')),
+        'confidence': None,
+    }
 
     csam = filter_results.get('csam', {}).get('csamFilterFilterResult', {})
-    if csam.get('matchState') == 'MATCH_FOUND':
-        triggered.add('CSAM')
+    states['CSAM'] = state(csam)
 
     uris = filter_results.get('malicious_uris', {}).get('maliciousUriFilterResult', {})
-    if uris.get('matchState') == 'MATCH_FOUND':
-        triggered.add('MALICIOUS_URIS')
+    states['MALICIOUS_URIS'] = state(uris)
 
-    return triggered
+    return states
+
+
+def print_template_config(client: ModelArmorClient):
+    """Print the template's filter configuration so every report is tied to the
+    exact settings it was measured against."""
+    try:
+        tpl = client.describe_template()
+    except Exception as e:
+        print(f"\n⚠️  Could not fetch the template configuration ({e}) — continuing without it.")
+        return
+
+    fc = tpl.get('filterConfig', {})
+    meta = tpl.get('templateMetadata', {})
+    print("\n🧩 TEMPLATE CONFIGURATION")
+    print(f"   Template : {tpl.get('name', client.template_id)}")
+
+    pi = fc.get('piAndJailbreakFilterSettings', {})
+    if pi.get('filterEnforcement') == 'ENABLED':
+        print(f"   Prompt injection & jailbreak : ENABLED ({pi.get('confidenceLevel', 'default')})")
+    else:
+        print("   Prompt injection & jailbreak : disabled")
+
+    sdp = fc.get('sdpSettings', {})
+    if sdp.get('basicConfig', {}).get('filterEnforcement') == 'ENABLED':
+        print("   Sensitive Data Protection    : BASIC mode")
+        print("     ⚠️  Basic mode only detects credit cards, financial account numbers,")
+        print("        GCP credentials/API keys and passwords (plus US SSN/ITIN in US")
+        print("        regions). Emails, phone numbers and country-specific IDs (e.g.")
+        print("        BRAZIL_CPF_NUMBER) require ADVANCED mode with a DLP inspect template.")
+    elif 'advancedConfig' in sdp:
+        adv = sdp['advancedConfig']
+        print("   Sensitive Data Protection    : ADVANCED mode")
+        if adv.get('inspectTemplate'):
+            print(f"     inspect template   : {adv['inspectTemplate']}")
+        if adv.get('deidentifyTemplate'):
+            print(f"     deidentify template: {adv['deidentifyTemplate']}")
+    else:
+        print("   Sensitive Data Protection    : disabled")
+
+    rai = fc.get('raiSettings', {}).get('raiFilters', [])
+    if rai:
+        rai_str = ', '.join(f"{r.get('filterType')}:{r.get('confidenceLevel', 'default')}" for r in rai)
+        print(f"   Responsible AI               : {rai_str}")
+    else:
+        print("   Responsible AI               : disabled")
+
+    uri = fc.get('maliciousUriFilterSettings')
+    if uri is not None:
+        print(f"   Malicious URIs               : {uri.get('filterEnforcement', '?')}")
+    csam = fc.get('csamFilterSettings')
+    if csam is not None:
+        print(f"   CSAM                         : {csam.get('filterEnforcement', '?')}")
+
+    extras = []
+    if meta.get('enforcementType'):
+        extras.append(f"enforcement={meta['enforcementType']}")
+    alias = meta.get('filterVersionSelector', {}).get('alias')
+    if alias:
+        extras.append(f"filter_version={alias}")
+    mld = meta.get('multiLanguageDetection', {}).get('enableMultiLanguageDetection')
+    if mld is not None:
+        extras.append(f"multi_language={'on' if mld else 'off'}")
+    if extras:
+        print(f"   Metadata                     : {', '.join(extras)}")
 
 
 def percentile(values: List[float], p: float) -> float:
@@ -258,22 +360,38 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
     prompts_data: List[Dict[str, Any]] = []
     invalid_labels: List[Tuple[int, str]] = []
 
+    skipped_empty = 0
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
             header = next(reader, None)
-            has_category = bool(header) and len(header) >= 3 and header[2].strip().lower().startswith('categor')
+            if not header:
+                print("❌ CSV is empty (no header row).")
+                sys.exit(1)
+            # Resolve columns by header name so column order doesn't matter.
+            names = [h.strip().lower() for h in header]
+            prompt_idx = next((i for i, n in enumerate(names) if n.startswith('prompt')), None)
+            attack_idx = next((i for i, n in enumerate(names) if n.startswith('is_attack')), None)
+            if prompt_idx is None or attack_idx is None:
+                print(f"❌ CSV header must contain 'Prompt' and 'Is_Attack' columns (found: {', '.join(header)}).")
+                sys.exit(1)
+            category_idx = next((i for i, n in enumerate(names) if n.startswith('categor')), None)
 
             # enumerate from 2 because the header is row 1.
             for row_num, row in enumerate(reader, start=2):
-                if len(row) < 2:
+                if len(row) <= max(prompt_idx, attack_idx):
                     continue
-                prompt_text = row[0].strip()
-                is_attack_str = row[1].strip().lower()
+                prompt_text = row[prompt_idx].strip()
+                if not prompt_text:
+                    # A row like `,,` would otherwise be sent to the API as a
+                    # billable "safe" prompt and counted as a bogus TN.
+                    skipped_empty += 1
+                    continue
+                is_attack_str = row[attack_idx].strip().lower()
                 is_attack = is_attack_str in ('yes', 'y', 'true', '1')
                 expected_cats: Set[str] = set()
-                if has_category and len(row) >= 3:
-                    raw_cat = row[2].strip()
+                if category_idx is not None and len(row) > category_idx:
+                    raw_cat = row[category_idx].strip()
                     if raw_cat:
                         tokens = [p.strip() for chunk in raw_cat.split('|') for p in chunk.split(',') if p.strip()]
                         for tok in tokens:
@@ -298,6 +416,25 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
         print(_format_accepted_categories())
         sys.exit(1)
 
+    if skipped_empty:
+        print(f"\nℹ️  {skipped_empty} row(s) with an empty Prompt were skipped.")
+
+    # Warn upfront about prompts that likely exceed per-filter token limits.
+    oversized: List[Tuple[int, int, List[str]]] = []
+    for idx, p in enumerate(prompts_data, start=1):
+        est_tokens = len(p['text']) // EST_CHARS_PER_TOKEN
+        at_risk = [cat for cat, limit in FILTER_TOKEN_LIMITS.items() if est_tokens > limit]
+        if at_risk:
+            oversized.append((idx, est_tokens, at_risk))
+    if oversized:
+        print(f"\n⚠️  {len(oversized)} prompt(s) may exceed per-filter token limits")
+        print(f"   (~{EST_CHARS_PER_TOKEN} chars/token estimate). Affected filters return EXECUTION_SKIPPED")
+        print("   instead of a verdict — reported separately (SKIP column), not as PASSED:")
+        for idx, est_tokens, at_risk in oversized:
+            print(f"   prompt #{idx}: ~{est_tokens} tokens → {', '.join(at_risk)}")
+
+    print_template_config(client)
+
     print(f"\n🚀 Starting test ({len(prompts_data)} prompts)")
     print("-" * 110)
     print(f"{'PROMPT (Preview)':<45} | {'EXPECTED':<17} | {'DETECTED':<10} | {'EVALUATION'}")
@@ -305,10 +442,12 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
 
     g_tp = g_fp = g_fn = g_tn = 0
     g_errors = 0
+    g_prompts_with_skips = 0
     failed_prompts: List[Dict[str, Any]] = []
-    # Per-category confusion matrix.
+    # Per-category confusion matrix. 'skip' counts prompts the filter did not
+    # evaluate (EXECUTION_SKIPPED) — excluded from that category's matrix.
     cat_stats: Dict[str, Dict[str, int]] = {
-        c: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0} for c in KNOWN_CATEGORIES
+        c: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'skip': 0} for c in KNOWN_CATEGORIES
     }
 
     for p_data in prompts_data:
@@ -343,7 +482,7 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
             continue
 
         is_blocked = response_data.get('sanitizationResult', {}).get('filterMatchState') == 'MATCH_FOUND'
-        triggered_cats = extract_triggered_categories(response_data)
+        filter_states = extract_filter_states(response_data)
 
         # Overall binary metrics.
         if is_attack_expected and is_blocked:
@@ -361,8 +500,13 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
 
         # Per-category metrics (each category is an independent binary classifier).
         for cat in KNOWN_CATEGORIES:
+            st = filter_states[cat]
+            if st['skipped']:
+                # The filter never evaluated this prompt — neither a hit nor a miss.
+                cat_stats[cat]['skip'] += 1
+                continue
             expected = cat in expected_cats
-            predicted = cat in triggered_cats
+            predicted = st['match']
             if expected and predicted:
                 cat_stats[cat]['tp'] += 1
             elif not expected and predicted:
@@ -372,10 +516,23 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
             else:
                 cat_stats[cat]['tn'] += 1
 
+        matched_detail = [
+            f"{cat}:{filter_states[cat]['confidence']}" if filter_states[cat]['confidence'] else cat
+            for cat in KNOWN_CATEGORIES if filter_states[cat]['match']
+        ]
+        skipped_filters = [cat for cat in KNOWN_CATEGORIES if filter_states[cat]['skipped']]
+        if skipped_filters:
+            g_prompts_with_skips += 1
+        detail_str = ""
+        if matched_detail:
+            detail_str += f"  [{', '.join(matched_detail)}]"
+        if skipped_filters:
+            detail_str += f"  [SKIPPED: {', '.join(skipped_filters)}]"
+
         prompt_preview = (prompt.replace('\n', ' ')[:42] + '...') if len(prompt) > 42 else prompt.replace('\n', ' ')
         exp_str = "ATTACK" if is_attack_expected else "SAFE"
         det_str = "BLOCKED" if is_blocked else "PASSED"
-        print(f"{prompt_preview:<45} | {exp_str:<17} | {det_str:<10} | {eval_str}")
+        print(f"{prompt_preview:<45} | {exp_str:<17} | {det_str:<10} | {eval_str}{detail_str}")
 
         if request_delay:
             time.sleep(request_delay)
@@ -395,6 +552,8 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
     print(f"\n🛡️  OVERALL PERFORMANCE (Any Block)")
     print(f"   Total Prompts Evaluated  : {g_tot}")
     print(f"   API Errors (excluded)    : {g_errors}")
+    if g_prompts_with_skips:
+        print(f"   Prompts w/ skipped filter: {g_prompts_with_skips} (some filters returned EXECUTION_SKIPPED — see SKIP column)")
     print(f"   Base Metrics    : TP={g_tp} | TN={g_tn} | FP={g_fp} | FN={g_fn}")
     print(f"   Precision       : {g_prec:.4f}")
     print(f"   Recall          : {g_rec:.4f}")
@@ -406,7 +565,7 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
         print("\n" + "-" * 80)
         print("📂 PERFORMANCE BY CATEGORY")
         print("-" * 80)
-        print(f"{'CATEGORY':<20} | {'TP':>4} | {'FP':>4} | {'FN':>4} | {'TN':>4} | {'PREC':>6} | {'REC':>6} | {'F1':>6}")
+        print(f"{'CATEGORY':<20} | {'TP':>4} | {'FP':>4} | {'FN':>4} | {'TN':>4} | {'SKIP':>4} | {'PREC':>6} | {'REC':>6} | {'F1':>6}")
         f1_values = []
         for cat in KNOWN_CATEGORIES:
             s = cat_stats[cat]
@@ -414,11 +573,16 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
             # Only include categories with at least one expected or predicted positive in the macro-F1.
             if s['tp'] + s['fp'] + s['fn'] > 0:
                 f1_values.append(f1)
-            print(f"{cat:<20} | {s['tp']:>4} | {s['fp']:>4} | {s['fn']:>4} | {s['tn']:>4} | {prec:>6.4f} | {rec:>6.4f} | {f1:>6.4f}")
+            print(f"{cat:<20} | {s['tp']:>4} | {s['fp']:>4} | {s['fn']:>4} | {s['tn']:>4} | {s['skip']:>4} | {prec:>6.4f} | {rec:>6.4f} | {f1:>6.4f}")
 
         if f1_values:
             macro_f1 = sum(f1_values) / len(f1_values)
             print(f"\n   Macro F1 (mean across categories with signal): {macro_f1:.4f}")
+
+        if any(s['skip'] for s in cat_stats.values()):
+            print("\n   ⚠️  SKIP = the filter returned EXECUTION_SKIPPED (did not evaluate the")
+            print("      prompt, e.g. token limit exceeded). Skipped prompts are excluded from")
+            print("      that category's confusion matrix — they are neither hits nor misses.")
     else:
         print("\n(ℹ️  Category column missing or empty in CSV — per-category F1 not computed.)")
 
