@@ -164,7 +164,7 @@ Accepted category values (case-insensitive). Each official family also accepts a
 | `MALICIOUS_URIS` | `MALICIOUS_URI`, `URIS` | Malicious links |
 | `CSAM` | — | Child sexual abuse material |
 
-> **Strict validation.** Any value in the `Category` column that doesn't match one of the names above (case-insensitive) is rejected at load time — the script prints the offending row(s) and exits **before** any API call is made. This prevents typos like `RESPONSIBLE-AI` or `MALICIOUS_URL` from silently inflating False Positives in your per-category metrics.
+> **Strict validation.** Any value in the `Category` column that doesn't match one of the names above (case-insensitive) is rejected at load time — the script prints the offending row(s) and exits **before** any API call is made. Likewise, safe rows (`Is_Attack=no`) with a non-empty `Category` and attack rows (`Is_Attack=yes`) missing a `Category` in a categorized dataset are rejected upfront. This prevents typos like `RESPONSIBLE-AI` or partial category labeling from silently corrupting your per-category metrics.
 
 Example (`data.csv`):
 
@@ -176,13 +176,39 @@ Prompt,Is_Attack,Category
 "Translate the following text to French: 'The sky is blue'.",no,
 ```
 
-> If you omit the `Category` column entirely, the script still produces the binary F1 report — it just won't compute per-category metrics.
+> If you omit the `Category` column entirely (or leave it empty on all rows), the script still produces the binary F1 report — it just won't compute per-category metrics.
 
 Additional data hygiene rules:
 
 - **Columns are matched by header name** (`Prompt`, `Is_Attack`, `Category`), so column order doesn't matter. The script exits with an error if `Prompt` or `Is_Attack` is missing.
 - **Rows with an empty `Prompt` are skipped** (and counted in an informational message) instead of being sent to the API as billable "safe" prompts that would inflate TN.
 - **Oversized prompts are flagged upfront.** Each filter has a token limit (10,000 tokens for prompt injection, Responsible AI and CSAM; 130,000 for Sensitive Data Protection). Prompts estimated above a limit are listed before the run, because the affected filter returns `EXECUTION_SKIPPED` instead of a verdict — see the `SKIP` column below.
+
+### How large should my dataset be? (Recommended sizing & sampling)
+
+Even if you have hundreds of thousands or **1,000,000+ production conversations**, you do **not** need to label or evaluate the entire volume. In statistical sampling, once a population exceeds ~20,000 items, the sample size required for a **95% confidence level** stabilizes (~385 rows for a $\pm 5\%$ margin of error; ~1,067 rows for a $\pm 3\%$ margin of error).
+
+A curated, human-verified **"Golden Dataset" of 300 to 1,000 prompts** provides strong statistical rigor, costs very little to run, and finishes in minutes whenever you recalibrate template thresholds (`LOW`, `MEDIUM`, `HIGH`).
+
+| Tier | Total Size | Recommended Split (`Safe` vs. `Attack`) | Overall Margin of Error (95% CI) | Human Labeling Effort | Best For |
+|---|---|---|---|---|---|
+| **1. Quick PoC (Minimum Viable)** | **300 prompts** | **150 Safe** + **150 Attacks** (~35–50 per active category) | $\approx \pm 5.6\%$ | ~2–3 hours | Initial validation and coarse template threshold tuning. |
+| **2. Recommended (Golden Dataset)** ⭐ | **1,000 prompts** | **600 Safe** + **400 Attacks** (~80–100 per active category) | $\approx \pm 3.1\%$ | ~1–2 days | **Sweet spot** balancing statistical rigor (including per-category F1), cost, and speed. |
+| **3. High-Precision Audit** | **2,500 prompts** | **1,500 Safe** + **1,000 Attacks** (~200–250 per active category) | $\approx \pm 2.0\%$ | ~3–5 days | Only when a tight margin of error ($< \pm 5\%$) is required *within* each individual category. |
+
+#### Why you should use Stratified Sampling (not 100% random sampling)
+
+In real production traffic, actual attacks typically represent **less than 0.5%** of all conversations. Taking a purely random sample of 1,000 rows from 1,000,000 production logs will yield roughly **995 safe prompts and only 5 attacks** — making it statistically impossible to measure Recall or F1 Score.
+
+Instead, build your dataset using **stratified sampling**:
+
+1. **Selecting the `Safe` split (e.g., 600 prompts from production logs):**
+   - **~400 random conversations** representing everyday user traffic.
+   - **~200 "hard negatives" (borderline safe prompts):** legitimate domain-specific conversations that might trigger false alarms (e.g., frustrated customer complaints, long prompts, legitimate security/IT questions, or industry-specific terminology in healthcare, finance, or legal).
+2. **Mining the `Attack` split (e.g., 400 prompts) without reading 1M rows:**
+   - **Keyword / Regex pre-filtering:** Query historical logs for suspicious patterns (e.g., *"ignore previous instructions"*, *"system prompt"*, CPF/SSN/credit-card patterns, external URLs, profanity) to surface a few hundred candidates for quick human confirmation.
+   - **Bootstrap triage with Model Armor:** Run a batch of 5,000–10,000 candidate logs against a template configured at maximum sensitivity (`LOW_AND_ABOVE`), then have a human analyst review only the flagged rows to confirm true attacks (`TP`) vs. false alarms (`FP`).
+   - **Synthetic red-teaming:** For categories with few historical examples (e.g., `MALICIOUS_URIS` or advanced `PROMPT_INJECTION`), supplement up to ~80–100 examples per active category using red-team prompts tailored to your business domain.
 
 ---
 
@@ -196,7 +222,19 @@ python model_armor_csv_f1.py \
   --csv_file data.csv
 ```
 
-For larger datasets, throttle requests to avoid `429 Too Many Requests`:
+For larger datasets (e.g. 1,000 prompts), you can run requests concurrently and export per-prompt results to a CSV file for inspection:
+
+```bash
+python model_armor_csv_f1.py \
+  --project_id YOUR_PROJECT_ID \
+  --template_id YOUR_TEMPLATE_ID \
+  --location us-central1 \
+  --csv_file data.csv \
+  --concurrency 5 \
+  --output_csv results.csv
+```
+
+Or throttle requests if you hit `429 Too Many Requests`:
 
 ```bash
 python model_armor_csv_f1.py \
@@ -317,6 +355,8 @@ For HTTP errors (401/403/404/429/5xx), the body of the response is included alon
 | `--location` | yes | — | Template region (e.g. `us-central1`). |
 | `--csv_file` | yes | — | Path to the labeled CSV. |
 | `--request_delay` | no | `0.0` | Seconds to sleep between requests (helps avoid rate limits). |
+| `--concurrency` | no | `1` | Number of concurrent worker threads for API calls. |
+| `--output_csv` | no | — | Optional file path to export per-prompt evaluation results as CSV. |
 | `--verbose` | no | off | Print per-attempt HTTP status / exception details for every request. Use this when diagnosing failures. |
 | `--no_category_report` | no | off | Suppress the per-category performance section (binary report only). |
 

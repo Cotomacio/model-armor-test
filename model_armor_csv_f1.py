@@ -15,13 +15,16 @@ Usage:
 
 import csv
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import shutil
 import subprocess
 import sys
+import threading
 import time
-from typing import Dict, Any, Set, List, Tuple
+from typing import Dict, Any, Set, List, Tuple, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 import google.auth
 from google.auth.transport.requests import Request
 
@@ -53,12 +56,20 @@ FILTER_TOKEN_LIMITS = {
 
 
 class ModelArmorClient:
-    def __init__(self, project_id: str, template_id: str, location: str, verbose: bool = False):
+    def __init__(self, project_id: str, template_id: str, location: str,
+                 verbose: bool = False, max_workers: int = 1):
         self.project_id = project_id
         self.template_id = template_id
         self.location = location
         self.verbose = verbose
         self._credentials = None
+        self._auth_lock = threading.Lock()
+        self._latency_lock = threading.Lock()
+        self._session = requests.Session()
+        pool_size = max(4, max_workers)
+        adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
         # Latency of each successful HTTP call (in milliseconds).
         self.latencies_ms: List[float] = []
 
@@ -88,15 +99,27 @@ class ModelArmorClient:
         return self._credentials
 
     def _access_token(self) -> str:
-        creds = self._get_credentials()
-        # Proactive refresh if the token is expired or about to expire.
-        if getattr(creds, "expired", False) or not getattr(creds, "token", None):
-            try:
-                creds.refresh(Request())
-            except Exception:
-                # For static credentials (gcloud fallback) refresh is a no-op.
-                pass
-        return creds.token
+        with self._auth_lock:
+            creds = self._get_credentials()
+            # Proactive refresh if the token is expired or about to expire.
+            if getattr(creds, "expired", False) or not getattr(creds, "token", None):
+                try:
+                    creds.refresh(Request())
+                except Exception:
+                    # For static credentials (gcloud fallback) refresh is a no-op.
+                    pass
+            return creds.token
+
+    def _build_headers(self, json_content: bool = True) -> Dict[str, str]:
+        token = self._access_token()
+        headers: Dict[str, str] = {"Authorization": f"Bearer {token}"}
+        if json_content:
+            headers["Content-Type"] = "application/json"
+        creds = self._credentials
+        quota_project = getattr(creds, "quota_project_id", None) if creds is not None else None
+        if quota_project:
+            headers["x-goog-user-project"] = quota_project
+        return headers
 
     def sanitize(self, prompt: str) -> Dict[str, Any]:
         url = (
@@ -113,13 +136,9 @@ class ModelArmorClient:
 
         for attempt in range(4):
             try:
-                token = self._access_token()
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {token}",
-                }
+                headers = self._build_headers(json_content=True)
                 start = time.perf_counter()
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                response = self._session.post(url, headers=headers, json=payload, timeout=30)
                 latency_ms = (time.perf_counter() - start) * 1000.0
                 last_response = response
 
@@ -128,7 +147,8 @@ class ModelArmorClient:
 
                 if response.status_code == 401:
                     # Token rejected: force a refresh on the next iteration.
-                    self._credentials = None
+                    with self._auth_lock:
+                        self._credentials = None
                     continue
                 if response.status_code == 429 or 500 <= response.status_code < 600:
                     time.sleep(backoff)
@@ -136,8 +156,12 @@ class ModelArmorClient:
                     continue
 
                 response.raise_for_status()
-                self.latencies_ms.append(latency_ms)
-                return response.json()
+                with self._latency_lock:
+                    self.latencies_ms.append(latency_ms)
+                data = response.json()
+                if isinstance(data, dict):
+                    data["_latency_ms"] = latency_ms
+                return data
             except requests.RequestException as e:
                 last_exception_type = type(e).__name__
                 last_exception_msg = str(e)
@@ -172,8 +196,8 @@ class ModelArmorClient:
             f"projects/{self.project_id}/locations/{self.location}/"
             f"templates/{self.template_id}"
         )
-        token = self._access_token()
-        response = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        headers = self._build_headers(json_content=False)
+        response = self._session.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         return response.json()
 
@@ -363,9 +387,12 @@ def _format_accepted_categories() -> str:
 
 
 def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float = 0.0,
-                 category_report: bool = True):
+                 category_report: bool = True, concurrency: int = 1,
+                 output_csv: Optional[str] = None):
     prompts_data: List[Dict[str, Any]] = []
     invalid_labels: List[Tuple[int, str]] = []
+    safe_with_category: List[Tuple[int, str]] = []
+    attack_missing_category: List[int] = []
 
     skipped_empty = 0
     try:
@@ -397,6 +424,7 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
                 is_attack_str = row[attack_idx].strip().lower()
                 is_attack = is_attack_str in ('yes', 'y', 'true', '1')
                 expected_cats: Set[str] = set()
+                raw_cat = ""
                 if category_idx is not None and len(row) > category_idx:
                     raw_cat = row[category_idx].strip()
                     if raw_cat:
@@ -406,7 +434,13 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
                                 invalid_labels.append((row_num, tok))
                         expected_cats = parse_expected_categories(raw_cat)
 
+                if not is_attack and raw_cat:
+                    safe_with_category.append((row_num, raw_cat))
+                elif is_attack and not raw_cat:
+                    attack_missing_category.append(row_num)
+
                 prompts_data.append({
+                    "row_num": row_num,
                     "text": prompt_text,
                     "is_attack": is_attack,
                     "expected_categories": expected_cats,
@@ -421,6 +455,25 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
             print(f"   row {row_num}: {tok!r}")
         print()
         print(_format_accepted_categories())
+        sys.exit(1)
+
+    if safe_with_category:
+        print(f"❌ Safe rows (Is_Attack=no) must not have a Category in {filepath} — aborting before evaluation.\n")
+        for row_num, raw_cat in safe_with_category:
+            print(f"   row {row_num}: Category={raw_cat!r} on a safe row")
+        print("\nLeave the Category column empty for safe rows (otherwise per-category metrics would treat them as expected attacks).")
+        sys.exit(1)
+
+    has_any_expected = any(p['expected_categories'] for p in prompts_data)
+    if has_any_expected and category_report and attack_missing_category:
+        print(f"❌ Attack rows (Is_Attack=yes) with an empty Category in {filepath} — aborting before evaluation.\n")
+        for row_num in attack_missing_category:
+            print(f"   row {row_num}: Is_Attack=yes but Category is empty")
+        print(
+            "\nWhen using per-category evaluation, every attack row must specify its expected Category\n"
+            "(otherwise a valid block on that row is counted as a per-category False Positive).\n"
+            "Fill in the Category column for the row(s) above, or pass --no_category_report for binary evaluation only."
+        )
         sys.exit(1)
 
     if skipped_empty:
@@ -451,6 +504,7 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
     g_errors = 0
     g_prompts_with_skips = 0
     failed_prompts: List[Dict[str, Any]] = []
+    export_rows: List[Dict[str, Any]] = []
     # Per-category confusion matrix. 'skip' counts prompts the filter did not
     # evaluate (EXECUTION_SKIPPED); 'na' counts responses where the filter was
     # absent (not configured in the template). Both are excluded from the
@@ -460,100 +514,154 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
         for c in KNOWN_CATEGORIES
     }
 
-    for p_data in prompts_data:
-        prompt = p_data['text']
-        is_attack_expected = p_data['is_attack']
-        expected_cats: Set[str] = p_data['expected_categories']
-
-        response_data = client.sanitize(prompt)
-
-        if response_data.get('is_error'):
-            g_errors += 1
-            err_status = response_data.get('error_status')
-            if err_status == 'no_response':
-                err_short = f"no_response: {response_data.get('error_type', '?')}"
-            else:
-                err_short = f"HTTP {err_status}"
-            eval_str = f"⚠️  ERROR ({err_short})"
-            exp_str = "ATTACK" if is_attack_expected else "SAFE"
-            det_str = "—"
-            failed_prompts.append({
-                'prompt': prompt,
-                'status': err_status,
-                'type': response_data.get('error_type'),
-                'message': response_data.get('error_message'),
-                'body': response_data.get('error_body'),
-                'url': response_data.get('error_url'),
-            })
-            prompt_preview = (prompt.replace('\n', ' ')[:42] + '...') if len(prompt) > 42 else prompt.replace('\n', ' ')
-            print(f"{prompt_preview:<45} | {exp_str:<17} | {det_str:<10} | {eval_str}")
-            if request_delay:
+    workers = max(1, concurrency)
+    if workers > 1 and prompts_data:
+        # Warm up credentials once before spawning worker threads.
+        try:
+            client._access_token()
+        except Exception:
+            pass
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = []
+        for idx, p_data in enumerate(prompts_data):
+            futures.append(executor.submit(client.sanitize, p_data['text']))
+            if request_delay and idx + 1 < len(prompts_data):
                 time.sleep(request_delay)
-            continue
+    else:
+        executor = None
+        futures = []
 
-        is_blocked = response_data.get('sanitizationResult', {}).get('filterMatchState') == 'MATCH_FOUND'
-        filter_states = extract_filter_states(response_data)
+    try:
+        for idx, p_data in enumerate(prompts_data, start=1):
+            prompt = p_data['text']
+            is_attack_expected = p_data['is_attack']
+            expected_cats: Set[str] = p_data['expected_categories']
 
-        # Overall binary metrics.
-        if is_attack_expected and is_blocked:
-            eval_str = "✅ TP (Correct Block)"
-            g_tp += 1
-        elif not is_attack_expected and is_blocked:
-            eval_str = "❌ FP (False Alarm)"
-            g_fp += 1
-        elif is_attack_expected and not is_blocked:
-            eval_str = "❌ FN (Attack Passed!)"
-            g_fn += 1
-        else:
-            eval_str = "✅ TN (Correctly Allowed)"
-            g_tn += 1
-
-        # Per-category metrics (each category is an independent binary classifier).
-        for cat in KNOWN_CATEGORIES:
-            st = filter_states[cat]
-            if cat in expected_cats:
-                cat_stats[cat]['exp'] += 1
-            if st['absent']:
-                # Filter missing from the response (not configured in the
-                # template) — counting it as TN would disguise "never ran"
-                # as "ran and correctly allowed".
-                cat_stats[cat]['na'] += 1
-                continue
-            if st['skipped']:
-                # The filter never evaluated this prompt — neither a hit nor a miss.
-                cat_stats[cat]['skip'] += 1
-                continue
-            expected = cat in expected_cats
-            predicted = st['match']
-            if expected and predicted:
-                cat_stats[cat]['tp'] += 1
-            elif not expected and predicted:
-                cat_stats[cat]['fp'] += 1
-            elif expected and not predicted:
-                cat_stats[cat]['fn'] += 1
+            if executor is not None:
+                response_data = futures[idx - 1].result()
             else:
-                cat_stats[cat]['tn'] += 1
+                response_data = client.sanitize(prompt)
 
-        matched_detail = [
-            f"{cat}:{filter_states[cat]['confidence']}" if filter_states[cat]['confidence'] else cat
-            for cat in KNOWN_CATEGORIES if filter_states[cat]['match']
-        ]
-        skipped_filters = [cat for cat in KNOWN_CATEGORIES if filter_states[cat]['skipped']]
-        if skipped_filters:
-            g_prompts_with_skips += 1
-        detail_str = ""
-        if matched_detail:
-            detail_str += f"  [{', '.join(matched_detail)}]"
-        if skipped_filters:
-            detail_str += f"  [SKIPPED: {', '.join(skipped_filters)}]"
+            if response_data.get('is_error'):
+                g_errors += 1
+                err_status = response_data.get('error_status')
+                if err_status == 'no_response':
+                    err_short = f"no_response: {response_data.get('error_type', '?')}"
+                else:
+                    err_short = f"HTTP {err_status}"
+                eval_str = f"⚠️  ERROR ({err_short})"
+                exp_str = "ATTACK" if is_attack_expected else "SAFE"
+                det_str = "—"
+                failed_prompts.append({
+                    'prompt': prompt,
+                    'status': err_status,
+                    'type': response_data.get('error_type'),
+                    'message': response_data.get('error_message'),
+                    'body': response_data.get('error_body'),
+                    'url': response_data.get('error_url'),
+                })
+                export_rows.append({
+                    "Row": p_data.get("row_num", idx),
+                    "Prompt": prompt,
+                    "Expected_Attack": "yes" if is_attack_expected else "no",
+                    "Expected_Categories": "|".join(sorted(expected_cats)),
+                    "Detected": "ERROR",
+                    "Evaluation": "ERROR",
+                    "Matched_Filters": "",
+                    "Skipped_Filters": "",
+                    "Latency_ms": "",
+                    "Error_Status": str(err_status),
+                })
+                prompt_preview = (prompt.replace('\n', ' ')[:42] + '...') if len(prompt) > 42 else prompt.replace('\n', ' ')
+                print(f"{prompt_preview:<45} | {exp_str:<17} | {det_str:<10} | {eval_str}")
+                if executor is None and request_delay:
+                    time.sleep(request_delay)
+                continue
 
-        prompt_preview = (prompt.replace('\n', ' ')[:42] + '...') if len(prompt) > 42 else prompt.replace('\n', ' ')
-        exp_str = "ATTACK" if is_attack_expected else "SAFE"
-        det_str = "BLOCKED" if is_blocked else "PASSED"
-        print(f"{prompt_preview:<45} | {exp_str:<17} | {det_str:<10} | {eval_str}{detail_str}")
+            is_blocked = response_data.get('sanitizationResult', {}).get('filterMatchState') == 'MATCH_FOUND'
+            filter_states = extract_filter_states(response_data)
 
-        if request_delay:
-            time.sleep(request_delay)
+            # Overall binary metrics.
+            if is_attack_expected and is_blocked:
+                eval_str = "✅ TP (Correct Block)"
+                eval_code = "TP"
+                g_tp += 1
+            elif not is_attack_expected and is_blocked:
+                eval_str = "❌ FP (False Alarm)"
+                eval_code = "FP"
+                g_fp += 1
+            elif is_attack_expected and not is_blocked:
+                eval_str = "❌ FN (Attack Passed!)"
+                eval_code = "FN"
+                g_fn += 1
+            else:
+                eval_str = "✅ TN (Correctly Allowed)"
+                eval_code = "TN"
+                g_tn += 1
+
+            # Per-category metrics (each category is an independent binary classifier).
+            for cat in KNOWN_CATEGORIES:
+                st = filter_states[cat]
+                if cat in expected_cats:
+                    cat_stats[cat]['exp'] += 1
+                if st['absent']:
+                    # Filter missing from the response (not configured in the
+                    # template) — counting it as TN would disguise "never ran"
+                    # as "ran and correctly allowed".
+                    cat_stats[cat]['na'] += 1
+                    continue
+                if st['skipped']:
+                    # The filter never evaluated this prompt — neither a hit nor a miss.
+                    cat_stats[cat]['skip'] += 1
+                    continue
+                expected = cat in expected_cats
+                predicted = st['match']
+                if expected and predicted:
+                    cat_stats[cat]['tp'] += 1
+                elif not expected and predicted:
+                    cat_stats[cat]['fp'] += 1
+                elif expected and not predicted:
+                    cat_stats[cat]['fn'] += 1
+                else:
+                    cat_stats[cat]['tn'] += 1
+
+            matched_detail = [
+                f"{cat}:{filter_states[cat]['confidence']}" if filter_states[cat]['confidence'] else cat
+                for cat in KNOWN_CATEGORIES if filter_states[cat]['match']
+            ]
+            skipped_filters = [cat for cat in KNOWN_CATEGORIES if filter_states[cat]['skipped']]
+            if skipped_filters:
+                g_prompts_with_skips += 1
+            detail_str = ""
+            if matched_detail:
+                detail_str += f"  [{', '.join(matched_detail)}]"
+            if skipped_filters:
+                detail_str += f"  [SKIPPED: {', '.join(skipped_filters)}]"
+
+            prompt_preview = (prompt.replace('\n', ' ')[:42] + '...') if len(prompt) > 42 else prompt.replace('\n', ' ')
+            exp_str = "ATTACK" if is_attack_expected else "SAFE"
+            det_str = "BLOCKED" if is_blocked else "PASSED"
+            print(f"{prompt_preview:<45} | {exp_str:<17} | {det_str:<10} | {eval_str}{detail_str}")
+
+            latency_val = response_data.get("_latency_ms")
+            export_rows.append({
+                "Row": p_data.get("row_num", idx),
+                "Prompt": prompt,
+                "Expected_Attack": "yes" if is_attack_expected else "no",
+                "Expected_Categories": "|".join(sorted(expected_cats)),
+                "Detected": det_str,
+                "Evaluation": eval_code,
+                "Matched_Filters": "|".join(matched_detail),
+                "Skipped_Filters": "|".join(skipped_filters),
+                "Latency_ms": f"{latency_val:.1f}" if latency_val is not None else "",
+                "Error_Status": "",
+            })
+
+            if executor is None and request_delay:
+                time.sleep(request_delay)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     print("\n" + "=" * 80)
     print("📊 MODEL ARMOR EVALUATION REPORT")
@@ -578,7 +686,6 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
     print(f"   Overall F1 Score: {g_f1:.4f}")
 
     # Per-category F1 (only if the CSV provides category labels).
-    has_any_expected = any(p['expected_categories'] for p in prompts_data)
     if not category_report:
         print("\n(ℹ️  Per-category report suppressed via --no_category_report.)")
     elif has_any_expected:
@@ -699,6 +806,21 @@ def run_csv_test(client: ModelArmorClient, filepath: str, request_delay: float =
             else:
                 print(f"      • Inspect the response body above for an explicit reason field.")
 
+    if output_csv:
+        try:
+            fieldnames = [
+                "Row", "Prompt", "Expected_Attack", "Expected_Categories",
+                "Detected", "Evaluation", "Matched_Filters", "Skipped_Filters",
+                "Latency_ms", "Error_Status",
+            ]
+            with open(output_csv, 'w', encoding='utf-8', newline='') as out_f:
+                writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(export_rows)
+            print(f"\n💾 Detailed per-prompt results saved to: {output_csv}")
+        except Exception as e:
+            print(f"\n⚠️  Could not write output CSV to {output_csv}: {e}")
+
     print("\n" + "=" * 80)
 
 
@@ -710,12 +832,26 @@ if __name__ == "__main__":
     parser.add_argument("--csv_file", required=True)
     parser.add_argument("--request_delay", type=float, default=0.0,
                         help="Delay (s) between requests to avoid rate limiting.")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="Number of concurrent requests (default: 1).")
+    parser.add_argument("--output_csv", default=None,
+                        help="Optional file path to export per-prompt evaluation results as CSV.")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-attempt HTTP status / exception details for every request.")
     parser.add_argument("--no_category_report", action="store_true",
                         help="Suppress the per-category performance section (binary report only).")
 
     args = parser.parse_args()
-    client = ModelArmorClient(args.project_id, args.template_id, args.location, verbose=args.verbose)
-    run_csv_test(client, args.csv_file, request_delay=args.request_delay,
-                 category_report=not args.no_category_report)
+    if args.concurrency < 1:
+        parser.error("--concurrency must be >= 1")
+    client = ModelArmorClient(
+        args.project_id, args.template_id, args.location,
+        verbose=args.verbose, max_workers=args.concurrency,
+    )
+    run_csv_test(
+        client, args.csv_file,
+        request_delay=args.request_delay,
+        category_report=not args.no_category_report,
+        concurrency=args.concurrency,
+        output_csv=args.output_csv,
+    )
